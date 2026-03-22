@@ -1,0 +1,174 @@
+//+------------------------------------------------------------------+
+//|                                           TrendProphet_Safe.mq5 |
+//|                                  Copyright 2024, Trading Project |
+//+------------------------------------------------------------------+
+#property strict
+
+//--- Input Parameters
+input int      InpEMAPeriod      = 50;          // EMA Trend Period
+input int      InpATRPeriod      = 14;          // ATR Volatility Period
+input double   InpRiskPercent    = 0.5;         // Risk per trade (%)
+input double   InpRewardRatio    = 2.0;         // Reward-to-Risk Ratio
+input double   InpStopMult       = 2.0;         // ATR Multiplier (Higher = safer)
+input double   InpMaxDailyLoss   = 3.0;         // Max Daily Loss % (Circuit Breaker)
+input double   InpTrendThreshold = 50;          // Min points gap from EMA
+
+//--- Global Variables
+int      handleEMA;
+int      handleATR;
+datetime lastTradeDay = 0;
+double   startingDailyEquity = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   handleEMA = iMA(_Symbol, _Period, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   handleATR = iATR(_Symbol, _Period, InpATRPeriod);
+   
+   if(handleEMA == INVALID_HANDLE || handleATR == INVALID_HANDLE) 
+   {
+      Print("Failed to initialize indicators");
+      return(INIT_FAILED);
+   }
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1. Daily Drawdown Guard - Stops trading if today's loss is too high
+   if(IsDailyLossExceeded()) return;
+
+   // 2. Position Management - Only one trade allowed at a time
+   if(PositionsTotal() > 0) return;
+
+   // 3. Get Indicator Data
+   double ema[], atr[];
+   ArraySetAsSeries(ema, true);
+   ArraySetAsSeries(atr, true);
+   
+   if(CopyBuffer(handleEMA, 0, 0, 2, ema) < 2 || CopyBuffer(handleATR, 0, 0, 2, atr) < 2) return;
+   
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // 4. Entry Logic with "Gap" Filter (Avoids sideways "chop")
+   double trendGap = currentPrice - ema[0];
+   
+   if(trendGap > (InpTrendThreshold * _Point))
+   {
+      double stopLossDistance = atr[0] * InpStopMult;
+      double slPrice = currentPrice - stopLossDistance;
+      double tpPrice = currentPrice + (stopLossDistance * InpRewardRatio);
+      
+      double lotSize = CalculateLotSize(stopLossDistance);
+      
+      // Only execute if lot size is valid
+      if(lotSize > 0) 
+         ExecuteTrade(ORDER_TYPE_BUY, lotSize, slPrice, tpPrice);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Circuit Breaker: Limits maximum daily loss to protect capital    |
+//+------------------------------------------------------------------+
+bool IsDailyLossExceeded()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   
+   // Reset baseline at the start of each new day
+   if(lastTradeDay != dt.day) {
+      startingDailyEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      lastTradeDay = dt.day;
+   }
+   
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dailyLossPerc = ((startingDailyEquity - currentEquity) / startingDailyEquity) * 100.0;
+   
+   if(dailyLossPerc >= InpMaxDailyLoss) {
+      Comment("MAX DAILY LOSS REACHED: ", DoubleToString(dailyLossPerc, 2), "% \nTrading paused until tomorrow.");
+      return true;
+   }
+   
+   Comment("System Active | Day Risk: ", DoubleToString(dailyLossPerc, 2), "%");
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Lot Size based on Risk and available Leverage          |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double slDistance)
+{
+   double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin    = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double tickValue     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize      = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lotStep       = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   // 1. Calculate ideal lots based on % Risk
+   double riskAmount = accountEquity * (InpRiskPercent / 100.0);
+   double points     = slDistance / tickSize;
+   
+   if(points <= 0) return 0;
+   double lots = riskAmount / (points * tickValue);
+   
+   // 2. LEVERAGE SAFETY CHECK
+   double marginForOneLot;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, 1.0, SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginForOneLot))
+   {
+      // We limit the trade to use no more than 70% of Free Margin (conservative)
+      double maxLotsByLeverage = (freeMargin * 0.7) / marginForOneLot;
+      
+      if(lots > maxLotsByLeverage) {
+         Print("Leverage too low for risk. Scaling lots from ", lots, " down to ", maxLotsByLeverage);
+         lots = maxLotsByLeverage;
+      }
+   }
+
+   // 3. Normalize to broker standards
+   lots = MathFloor(lots / lotStep) * lotStep;
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   
+   double finalLot = MathMax(minLot, MathMin(maxLot, lots));
+   
+   // Final check: do we actually have enough money for even the minimum lot?
+   if(finalLot * marginForOneLot > freeMargin) return 0;
+
+   return finalLot;
+}
+
+//+------------------------------------------------------------------+
+//| Execute Trade Order with appropriate Filling Mode                |
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE type, double vol, double sl, double tp)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+   
+   uint fillingMode = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   
+   request.action   = TRADE_ACTION_DEAL;
+   request.symbol   = _Symbol;
+   request.volume   = vol;
+   request.type     = type;
+   request.price    = SymbolInfoDouble(_Symbol, (type == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID);
+   request.sl       = sl;
+   request.tp       = tp;
+   request.magic    = 123456;
+   request.deviation = 10;
+
+   // Handle filling mode automatically based on broker settings
+   if((fillingMode & SYMBOL_FILLING_FOK) != 0)      request.type_filling = ORDER_FILLING_FOK;
+   else if((fillingMode & SYMBOL_FILLING_IOC) != 0) request.type_filling = ORDER_FILLING_IOC;
+   else                                             request.type_filling = ORDER_FILLING_RETURN;
+   
+   if(!OrderSend(request, result))
+      Print("Trade Error: ", GetLastError(), " | Result Code: ", result.retcode);
+   else
+      Print("Trade Success! Lots: ", vol, " | SL: ", sl, " | TP: ", tp);
+}
